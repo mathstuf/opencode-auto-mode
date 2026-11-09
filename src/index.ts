@@ -1,11 +1,10 @@
 import { lstat, readFile, realpath, stat } from "node:fs/promises"
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path"
 
-import type { Plugin } from "@opencode-ai/plugin"
+import { Plugin } from "@opencode/plugin"
 
 // Register the package as ["file:///absolute/path/to/opencode-auto-mode", { "enabled": true }].
 const SERVICE = "auto-reviewer"
-const REVIEWER_AGENT = "auto-reviewer"
 const DEFAULT_REVIEW_TIMEOUT_MS = 60_000
 const CONTEXT_TIMEOUT_MS = 3_000
 const CACHE_TTL_MS = 60_000
@@ -15,22 +14,6 @@ const REVIEWER_PROMPT_URL = new URL("./auto-reviewer-prompt.md", import.meta.url
 type ModelRef = {
   providerID: string
   modelID: string
-}
-
-type PermissionRequest = {
-  id: string
-  sessionID: string
-  permission: string
-  metadata: Record<string, unknown>
-  tool?: {
-    messageID: string
-    callID: string
-  }
-}
-
-type PermissionAskedEvent = {
-  type: "permission.asked"
-  properties: PermissionRequest
 }
 
 type MessageWithParts = {
@@ -82,9 +65,6 @@ type Decision = {
   source: "static-allow" | "static-block" | "llm"
 }
 
-type PermissionAction = "ask" | "allow" | "deny"
-type PermissionRules = Record<string, PermissionAction | Record<string, PermissionAction>>
-
 const STATICALLY_ALLOWED_TOOLS = new Set([
   "apply_patch",
   "lsp",
@@ -135,7 +115,7 @@ const SECRET_ASSIGNMENT_NAME = String.raw`(?:(?:SECRET|TOKEN|KEY|CREDENTIAL|PASS
 const SECRET_OPTION_NAME = String.raw`(?:[A-Za-z0-9_-]*(?:secret|token|key|credential|password|passwd|private|dsn)[A-Za-z0-9_-]*)`
 const SECRET_NAME = /(?:secret|token|key|credential|password|passwd|private|dsn)/i
 const PATH_KEYS = new Set(["path", "filePath", "workdir", "cwd", "directory"])
-const FILESYSTEM_TOOLS = new Set(["apply_patch", "bash", "edit", "glob", "grep", "list", "lsp", "read", "write"])
+const FILESYSTEM_TOOLS = new Set(["apply_patch", "bash", "shell", "edit", "glob", "grep", "list", "lsp", "read", "write"])
 const PATH_OPTION = /^--?(?:config|directory|file|git-dir|input|output|path|root|work-tree|workdir)$/i
 
 function stripControl(value: string): string {
@@ -252,23 +232,6 @@ function parseModel(value: unknown): ModelRef | undefined {
   }
 }
 
-function removeNativePrompts(permission: PermissionAction | PermissionRules | undefined): PermissionRules {
-  if (!permission) return { "*": "allow" }
-  if (typeof permission === "string") return { "*": permission === "deny" ? "deny" : "allow" }
-
-  const result: PermissionRules = { "*": "allow" }
-  for (const [name, rule] of Object.entries(permission)) {
-    if (typeof rule === "string") {
-      result[name] = rule === "deny" ? "deny" : "allow"
-      continue
-    }
-    result[name] = Object.fromEntries(
-      Object.entries(rule).map(([pattern, action]) => [pattern, action === "deny" ? "deny" : "allow"]),
-    )
-  }
-  return result
-}
-
 function isOutsideWorkspace(workspace: string, target: string): boolean {
   const local = relative(workspace, target)
   return local === ".." || local.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(local)
@@ -374,7 +337,7 @@ async function inspectToolPaths(
 ): Promise<PathInspection> {
   const pathValues = collectPathValues(tool, args)
   let ambiguousShellSyntax = false
-  if (tool === "bash" && typeof args.command === "string") {
+  if ((tool === "bash" || tool === "shell") && typeof args.command === "string") {
     const shellWords = shellPathWords(args.command)
     const tokens = shellWords.words
     ambiguousShellSyntax = shellWords.ambiguous
@@ -461,7 +424,7 @@ function serializeToolInvocation(
   effectiveCwd?: string,
 ): SerializedInvocation {
   const pathProjection = serializedPathTargets(pathInspection)
-  if (tool === "bash" && typeof args.command === "string") {
+  if ((tool === "bash" || tool === "shell") && typeof args.command === "string") {
     const workdir = typeof args.workdir === "string" && args.workdir.trim() ? args.workdir.trim() : directory
     const resolvedCwd = effectiveCwd ?? resolve(directory, workdir)
     const commandProjection = redactShellCommandProjection(args.command.trim())
@@ -570,7 +533,7 @@ function serializeToolInvocation(
 }
 
 function analyzeTool(tool: string, args: Record<string, unknown>): Analysis {
-  if (tool === "bash") return analyzeCommand(typeof args.command === "string" ? args.command : "")
+  if (tool === "bash" || tool === "shell") return analyzeCommand(typeof args.command === "string" ? args.command : "")
   const behaviors = [`tool-call: invokes the ${tool} tool`]
   if (/(edit|write|patch|create|update|delete|remove|transition|comment|worklog|link)/i.test(tool)) {
     behaviors.push("mutation: the tool name indicates a state-changing operation")
@@ -584,7 +547,7 @@ function staticToolDecision(
   analysis: Analysis,
   pathInspection: PathInspection,
 ): Decision | null {
-  if (tool === "bash") {
+  if (tool === "bash" || tool === "shell") {
     const command = typeof args.command === "string" ? args.command.trim() : ""
     const staticResult = staticDecision(command, "bash", analysis)
     if (staticResult?.allowed === false) return staticResult
@@ -653,18 +616,16 @@ function extractRecentCommands(messages: MessageWithParts[], currentCallID?: str
 }
 
 async function getConversationContext(
-  client: Parameters<Plugin>[0]["client"],
+  client: any,
   sessionID: string,
   currentCallID?: string,
 ): Promise<ConversationContext> {
   const result = await withTimeout(
-    client.session.messages({ path: { id: sessionID }, query: { limit: 100 } }),
+    client.session.context({ sessionID }),
     CONTEXT_TIMEOUT_MS,
     "conversation context",
   )
-  if (result.error) throw new Error(`Could not read conversation context: ${errorMessage(result.error)}`)
-
-  const messages = (result.data ?? []) as MessageWithParts[]
+  const messages = (Array.isArray(result) ? result : result?.data ?? []) as MessageWithParts[]
   const userMessages = messages.filter((message) => message.info.role === "user")
   const assistantMessages = messages.filter((message) => message.info.role === "assistant")
   const userText = userMessages.map(extractText).filter((text): text is string => Boolean(text))
@@ -696,18 +657,20 @@ async function getConversationContext(
   }
 }
 
-async function getGitContext(
-  shell: Parameters<Plugin>[0]["$"],
-  directory: string,
-): Promise<{ branch: string | null; gitStatus: string | null }> {
+async function getGitContext(directory: string): Promise<{ branch: string | null; gitStatus: string | null }> {
+  const run = async (args: string[]) => {
+    const { execFile } = await import("node:child_process")
+    return await new Promise<{ code: number; stdout: string }>((resolve) => {
+      execFile("git", args, { cwd: directory, encoding: "utf8", timeout: 1_500, maxBuffer: 16_384 }, (error, stdout) => {
+        resolve({ code: error ? 1 : 0, stdout })
+      })
+    })
+  }
   try {
-    const [branchResult, statusResult] = await Promise.all([
-      withTimeout(shell`git branch --show-current`.cwd(directory).quiet().nothrow(), 1_500, "git branch"),
-      withTimeout(shell`git status --porcelain`.cwd(directory).quiet().nothrow(), 1_500, "git status"),
-    ])
+    const [branch, status] = await Promise.all([run(["branch", "--show-current"]), run(["status", "--porcelain"])])
     return {
-      branch: branchResult.exitCode === 0 ? stripControl(branchResult.text()).trim() || null : null,
-      gitStatus: statusResult.exitCode === 0 ? truncate(stripControl(statusResult.text()), 2_048) : null,
+      branch: branch.code === 0 ? stripControl(branch.stdout).trim() || null : null,
+      gitStatus: status.code === 0 ? truncate(stripControl(status.stdout), 2_048) : null,
     }
   } catch {
     return { branch: null, gitStatus: null }
@@ -735,8 +698,7 @@ async function getProjectDoc(directory: string): Promise<string | null> {
 }
 
 async function gatherContext(
-  client: Parameters<Plugin>[0]["client"],
-  shell: Parameters<Plugin>[0]["$"],
+  client: any,
   directory: string,
   sessionID: string,
   callID?: string,
@@ -749,7 +711,7 @@ async function gatherContext(
   }
   const [conversation, git, projectDoc] = await Promise.all([
     getConversationContext(client, sessionID, callID).catch(() => emptyConversation),
-    getGitContext(shell, directory),
+    getGitContext(directory),
     getProjectDoc(directory),
   ])
   return { ...conversation, ...git, projectDoc }
@@ -1019,260 +981,127 @@ function reviewCacheKey(sessionID: string, command: string, callID?: string): st
   return `${sessionID}\u0000${callID ?? ""}\u0000${command}`
 }
 
-export default (async ({ client, directory, $ }, options) => {
-  if (options?.enabled !== undefined && typeof options.enabled !== "boolean") {
-    throw new TypeError("auto-reviewer option 'enabled' must be a boolean")
-  }
-  if (options?.enabled === false) return {}
-  if (options?.model !== undefined && typeof options.model !== "string") {
-    throw new TypeError("auto-reviewer option 'model' must use the string format 'provider/model'")
-  }
-
-  const reviewerPrompt = (await readFile(REVIEWER_PROMPT_URL, "utf8")).trim()
-  if (!reviewerPrompt) throw new Error(`auto-reviewer prompt is empty: ${REVIEWER_PROMPT_URL.pathname}`)
-  const canonicalWorkspace = await realpath(directory).catch(() => resolve(directory))
-
-  const configuredModelSpec =
-    (typeof options?.model === "string" ? options.model.trim() : "") || process.env.OPENCODE_AUTO_REVIEWER_MODEL?.trim()
-  const configuredModel = parseModel(configuredModelSpec)
-  if (configuredModelSpec && !configuredModel) {
-    throw new TypeError("auto-reviewer option 'model' must use the format 'provider/model'")
-  }
-  const configuredTimeout = Number(
-    (typeof options?.timeoutMs === "number" || typeof options?.timeoutMs === "string" ? options.timeoutMs : undefined) ??
-      process.env.OPENCODE_AUTO_REVIEWER_TIMEOUT_MS,
-  )
-  const reviewTimeoutMs = Number.isFinite(configuredTimeout)
-    ? Math.min(Math.max(configuredTimeout, 1_000), 300_000)
-    : DEFAULT_REVIEW_TIMEOUT_MS
-  const cache = new Map<string, { expires: number; decision: Decision }>()
-  const pending = new Map<string, Promise<Decision>>()
-  let fallbackModel: ModelRef | undefined
-
-  async function log(level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) {
-    try {
-      await client.app.log({ body: { service: SERVICE, level, message, extra } })
-    } catch {
-      // Logging must never affect permission handling.
+export default Plugin.define({
+  id: "opencode-auto-mode",
+  async setup(ctx) {
+    const options = ctx.options as { enabled?: unknown; model?: unknown; timeoutMs?: unknown }
+    const client = ctx
+    const directory = ctx.location.directory
+    if (options?.enabled !== undefined && typeof options.enabled !== "boolean") {
+      throw new TypeError("auto-reviewer option 'enabled' must be a boolean")
     }
-  }
-
-  async function notify(message: string, variant: "info" | "success" | "warning" | "error") {
-    try {
-      await client.tui.showToast({
-        body: {
-          title: "Auto reviewer",
-          message: truncate(message, 500),
-          variant,
-          duration: variant === "info" ? 3_000 : 6_000,
-        },
-      })
-    } catch {
-      // Headless clients do not necessarily have a TUI attached.
-    }
-  }
-
-  async function reviewWithLLM(
-    command: string,
-    permission: string,
-    sessionID: string,
-    callID: string | undefined,
-    analysis: Analysis,
-  ): Promise<Decision> {
-    await notify(`Reviewing: ${truncate(command, 120)}`, "info")
-    const context = await gatherContext(client, $, directory, sessionID, callID)
-    const model = configuredModel ?? context.model ?? fallbackModel
-    const created = await client.session.create({
-      body: { parentID: sessionID, title: `Auto review: ${truncate(command, 60)}` },
-    })
-    if (created.error || !created.data?.id) {
-      throw new Error(`Could not create reviewer session: ${errorMessage(created.error)}`)
+    if (options?.enabled === false) return
+    if (options?.model !== undefined && typeof options.model !== "string") {
+      throw new TypeError("auto-reviewer option 'model' must use the string format 'provider/model'")
     }
 
-    const reviewerSessionID = created.data.id
-    let completed = false
-    try {
+    const reviewerPrompt = (await readFile(REVIEWER_PROMPT_URL, "utf8")).trim()
+    if (!reviewerPrompt) throw new Error(`auto-reviewer prompt is empty: ${REVIEWER_PROMPT_URL.pathname}`)
+    const canonicalWorkspace = await realpath(directory).catch(() => resolve(directory))
+    const configuredModelSpec =
+      (typeof options?.model === "string" ? options.model.trim() : "") || process.env.OPENCODE_AUTO_REVIEWER_MODEL?.trim()
+    const configuredModel = parseModel(configuredModelSpec)
+    if (configuredModelSpec && !configuredModel) {
+      throw new TypeError("auto-reviewer option 'model' must use the format 'provider/model'")
+    }
+    const configuredTimeout = Number(
+      (typeof options?.timeoutMs === "number" || typeof options?.timeoutMs === "string" ? options.timeoutMs : undefined) ??
+        process.env.OPENCODE_AUTO_REVIEWER_TIMEOUT_MS,
+    )
+    const reviewTimeoutMs = Number.isFinite(configuredTimeout)
+      ? Math.min(Math.max(configuredTimeout, 1_000), 300_000)
+      : DEFAULT_REVIEW_TIMEOUT_MS
+    const cache = new Map<string, { expires: number; decision: Decision }>()
+    const pending = new Map<string, Promise<Decision>>()
+
+    async function log(level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) {
+      const output = `[${SERVICE}] ${message}${extra ? ` ${JSON.stringify(extra)}` : ""}`
+      if (level === "error") console.error(output)
+      else if (level === "warn") console.warn(output)
+      else if (level === "debug") console.debug(output)
+      else console.info(output)
+    }
+
+    async function notify(message: string, _variant: "info" | "success" | "warning" | "error") {
+      console.info(`[${SERVICE}] ${truncate(message, 500)}`)
+    }
+
+    async function reviewWithLLM(
+      command: string,
+      permission: string,
+      sessionID: string,
+      callID: string | undefined,
+      analysis: Analysis,
+    ): Promise<Decision> {
+      await notify(`Reviewing: ${truncate(command, 120)}`, "info")
+      const context = await gatherContext(client, directory, sessionID, callID)
+      let model = configuredModel ?? context.model
+      if (!model) {
+        const selected = await ctx.model.default().catch(() => undefined)
+        if (selected) model = { providerID: selected.providerID, modelID: selected.id }
+      }
+      if (!model) throw new Error("No reviewer model is available")
       const response = await withTimeout(
-        client.session.prompt({
-          path: { id: reviewerSessionID },
-          body: {
-            agent: REVIEWER_AGENT,
-            ...(model ? { model } : {}),
-            parts: [
-              {
-                type: "text",
-                text: buildReviewRequest(command, permission, directory, context, analysis),
-              },
-            ],
-          },
+        ctx.generate.text({
+          model: { providerID: model.providerID, id: model.modelID },
+          prompt: `${reviewerPrompt}\n\n${buildReviewRequest(command, permission, directory, context, analysis)}`,
         }),
         reviewTimeoutMs,
         "LLM command review",
       )
-      completed = true
-      if (response.error || !response.data) {
-        throw new Error(`Reviewer request failed: ${errorMessage(response.error)}`)
-      }
-      const text = response.data.parts
-        .filter((part) => part.type === "text")
-        .map((part) => part.text)
-        .join("\n")
-      const decision = parseDecision(text)
+      const decision = parseDecision(response.text)
       return { ...decision, source: "llm" }
-    } finally {
-      if (!completed) {
-        try {
-          await client.session.abort({ path: { id: reviewerSessionID } })
-        } catch {
-          // Best-effort cleanup after a timeout or failed review.
-        }
-      }
+    }
+
+    async function decide(
+      operation: string,
+      permission: string,
+      sessionID: string,
+      callID?: string,
+      analysis: Analysis = analyzeCommand(operation),
+      staticResult: Decision | null = staticDecision(operation, permission, analysis),
+    ): Promise<Decision> {
+      const key = reviewCacheKey(sessionID, operation, callID)
+      const now = Date.now()
+      for (const [cacheKey, entry] of cache) if (entry.expires <= now) cache.delete(cacheKey)
+      const cached = cache.get(key)
+      if (cached) return cached.decision
+      const active = pending.get(key)
+      if (active) return active
+      const review = (async () => staticResult ?? reviewWithLLM(operation, permission, sessionID, callID, analysis))()
+      pending.set(key, review)
       try {
-        await client.session.delete({ path: { id: reviewerSessionID } })
-      } catch {
-        // Reviewer sessions are disposable and cleanup is best effort.
+        const decision = await review
+        cache.set(key, { expires: Date.now() + CACHE_TTL_MS, decision })
+        return decision
+      } finally {
+        pending.delete(key)
       }
     }
-  }
 
-  async function decide(
-    operation: string,
-    permission: string,
-    sessionID: string,
-    callID?: string,
-    analysis: Analysis = analyzeCommand(operation),
-    staticResult: Decision | null = staticDecision(operation, permission, analysis),
-  ): Promise<Decision> {
-    const key = reviewCacheKey(sessionID, operation, callID)
-    const now = Date.now()
-    for (const [cacheKey, entry] of cache) {
-      if (entry.expires <= now) cache.delete(cacheKey)
+    async function reportDecision(decision: Decision) {
+      if (decision.source !== "static-allow") {
+        await notify(`${decision.allowed ? "Allowed" : "Blocked"}: ${decision.reason}`, decision.allowed ? "success" : "warning")
+      }
     }
-    const cached = cache.get(key)
-    if (cached) return cached.decision
-    const active = pending.get(key)
-    if (active) return active
 
-    const review = (async () => {
-      if (staticResult) return staticResult
-      return reviewWithLLM(operation, permission, sessionID, callID, analysis)
-    })()
-    pending.set(key, review)
-    try {
-      const decision = await review
-      cache.set(key, { expires: Date.now() + CACHE_TTL_MS, decision })
-      return decision
-    } finally {
-      pending.delete(key)
-    }
-  }
-
-  async function reportDecision(decision: Decision) {
-    if (decision.source === "static-allow") return
-    await notify(
-      `${decision.allowed ? "Allowed" : "Blocked"}: ${decision.reason}`,
-      decision.allowed ? "success" : "warning",
-    )
-  }
-
-  async function handlePermissionEvent(request: PermissionRequest) {
-    if (!["bash", "external_directory"].includes(request.permission)) return
-    const command = request.metadata.command
-    if (typeof command !== "string" || !command.trim()) return
-
-    try {
-      const rawCommand = command.trim()
-      const analysis = analyzeCommand(rawCommand)
-      const staticResult = staticDecision(rawCommand, request.permission, analysis)
-      const projection = redactShellCommandProjection(rawCommand)
-      if (projection.incomplete && !staticResult) {
-        throw new Error("Auto-reviewer cannot safely review an incomplete permission request")
-      }
-      const decision = await decide(
-        projection.text,
-        request.permission,
-        request.sessionID,
-        request.tool?.callID,
-        analysis,
-        staticResult,
-      )
-      const reply = await client.postSessionIdPermissionsPermissionId({
-        path: { id: request.sessionID, permissionID: request.id },
-        body: { response: decision.allowed ? "once" : "reject" },
-      })
-      if (reply.error) {
-        await log("debug", "Permission was answered before auto-review completed", {
-          requestID: request.id,
-          error: errorMessage(reply.error),
-        })
-        return
-      }
-      await reportDecision(decision)
-    } catch (error) {
-      const failure = errorMessage(error)
-      await log("error", "Automatic command review failed; blocking the command", {
-        requestID: request.id,
-        error: failure,
-      })
-      const reply = await client.postSessionIdPermissionsPermissionId({
-        path: { id: request.sessionID, permissionID: request.id },
-        body: { response: "reject" },
-      })
-      if (reply.error) {
-        await log("error", "Could not reject permission after reviewer failure", {
-          requestID: request.id,
-          error: errorMessage(reply.error),
-        })
-      }
-      await notify(`Review failed; command blocked. ${failure}`, "error")
-    }
-  }
-
-  return {
-    config: async (config) => {
-      config.permission = removeNativePrompts(config.permission as PermissionAction | PermissionRules | undefined)
-
-      for (const agent of Object.values(config.agent ?? {})) {
-        if (!agent) continue
-        const permission = agent.permission
-        if (!permission) continue
-        agent.permission = removeNativePrompts(permission as PermissionAction | PermissionRules)
-      }
-
-      fallbackModel = configuredModel ?? parseModel(config.small_model) ?? parseModel(config.model)
-      const existingAgent = config.agent?.[REVIEWER_AGENT]
-      config.agent = {
-        ...config.agent,
-        [REVIEWER_AGENT]: {
-          ...existingAgent,
-          description: "Hidden tool-free agent that reviews OpenCode tool invocations.",
-          mode: "subagent",
-          hidden: true,
-          steps: 1,
-          permission: { "*": "deny" } as never,
-          prompt: reviewerPrompt,
-          ...(configuredModelSpec ? { model: configuredModelSpec } : {}),
-        },
-      }
-    },
-    "tool.execute.before": async (input, output) => {
-      const args = output.args && typeof output.args === "object" ? (output.args as Record<string, unknown>) : {}
-      const analysis = analyzeTool(input.tool, args)
-      const pathInspection = await inspectToolPaths(input.tool, args, directory, canonicalWorkspace)
+    await ctx.tool.hook("execute.before", async (event: any) => {
+      const args = event.input && typeof event.input === "object" ? event.input as Record<string, unknown> : {}
+      const analysis = analyzeTool(event.tool, args)
+      const pathInspection = await inspectToolPaths(event.tool, args, directory, canonicalWorkspace)
       if (pathInspection.external) analysis.behaviors.push("external-path: canonical target is outside the project")
       if (pathInspection.ambiguous) analysis.behaviors.push("ambiguous-path: canonical target could not be verified")
-      const staticResult = staticToolDecision(input.tool, args, analysis, pathInspection)
+      const staticResult = staticToolDecision(event.tool, args, analysis, pathInspection)
       let effectiveCwd: string | undefined
-      if (!staticResult && input.tool === "bash") {
+      if (!staticResult && (event.tool === "bash" || event.tool === "shell")) {
         const workdir = typeof args.workdir === "string" && args.workdir.trim() ? args.workdir.trim() : directory
         const requestedCwd = resolve(directory, workdir)
         effectiveCwd = await realpath(requestedCwd).catch(() => requestedCwd)
       }
-      const serialized = serializeToolInvocation(input.tool, args, directory, pathInspection, effectiveCwd)
+      const serialized = serializeToolInvocation(event.tool, args, directory, pathInspection, effectiveCwd)
       if (serialized.incomplete && !staticResult) {
-        throw new Error(`Auto-reviewer cannot safely review incomplete ${input.tool} arguments; operation blocked`)
+        throw new Error(`Auto-reviewer cannot safely review incomplete ${event.tool} arguments; operation blocked`)
       }
-      const operation = serialized.text
       if (effectiveCwd) {
         const local = relative(canonicalWorkspace, effectiveCwd)
         if (local === ".." || local.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(local)) {
@@ -1281,63 +1110,47 @@ export default (async ({ client, directory, $ }, options) => {
       }
       let decision: Decision
       try {
-        decision = await decide(operation, input.tool, input.sessionID, input.callID, analysis, staticResult)
+        decision = await decide(serialized.text, event.tool, event.sessionID, event.callID, analysis, staticResult)
       } catch (error) {
         const failure = errorMessage(error)
-        await log("error", "Pre-execution tool review failed; blocking the operation", {
-          tool: input.tool,
-          callID: input.callID,
-          error: failure,
-        })
-        await notify(`Review failed; ${input.tool} blocked. ${failure}`, "error")
-        throw new Error(`Auto-reviewer unavailable; ${input.tool} operation blocked: ${failure}`)
+        await log("error", "Pre-execution tool review failed; blocking the operation", { tool: event.tool, callID: event.callID, error: failure })
+        throw new Error(`Auto-reviewer unavailable; ${event.tool} operation blocked: ${failure}`)
       }
-
       await reportDecision(decision)
       if (!decision.allowed) {
-        await log("info", "Pre-execution tool review blocked the operation", {
-          tool: input.tool,
-          callID: input.callID,
-          reason: decision.reason,
-        })
-        throw new Error(`Auto-reviewer blocked ${input.tool}: ${decision.reason}`)
+        await log("info", "Pre-execution tool review blocked the operation", { tool: event.tool, callID: event.callID, reason: decision.reason })
+        throw new Error(`Auto-reviewer blocked ${event.tool}: ${decision.reason}`)
       }
-    },
-    "permission.ask": async (input, output) => {
-      if (!["bash", "external_directory"].includes(input.type)) return
-      const command = input.metadata.command
-      if (typeof command !== "string" || !command.trim()) return
+    })
+
+    await ctx.permission.hook("evaluate", async (event: any) => {
+      if (event.effect === "deny") return
+      const metadata = event.metadata ?? {}
+      const operation = typeof metadata.command === "string"
+        ? metadata.command.trim()
+        : `${event.action} ${event.resources.join(" ")}`.trim()
+      if (!operation) return
       try {
-        const rawCommand = command.trim()
-        const analysis = analyzeCommand(rawCommand)
-        const staticResult = staticDecision(rawCommand, input.type, analysis)
-        const projection = redactShellCommandProjection(rawCommand)
-        if (projection.incomplete && !staticResult) {
-          throw new Error("Auto-reviewer cannot safely review an incomplete permission request")
+        const reviewableAction = event.action === "shell" ? "bash" : event.action
+        const analysis = analyzeCommand(operation)
+        const staticResult = staticDecision(operation, reviewableAction, analysis)
+        if (event.source?.type === "tool" && !staticResult) {
+          event.effect = "allow"
+          event.message = "Tool invocation will be reviewed before execution"
+          return
         }
-        const decision = await decide(
-          projection.text,
-          input.type,
-          input.sessionID,
-          input.callID,
-          analysis,
-          staticResult,
-        )
-        output.status = decision.allowed ? "allow" : "deny"
+        const projection = redactShellCommandProjection(operation)
+        if (projection.incomplete && !staticResult) throw new Error("Auto-reviewer cannot safely review an incomplete permission request")
+        const decision = await decide(projection.text, reviewableAction, event.sessionID, event.source?.id, analysis, staticResult)
+        event.effect = decision.allowed ? "allow" : "deny"
+        event.message = decision.reason
         await reportDecision(decision)
       } catch (error) {
         const failure = errorMessage(error)
-        output.status = "deny"
-        await log("error", "Permission hook review failed; blocking the command", {
-          error: failure,
-        })
-        await notify(`Review failed; command blocked. ${failure}`, "error")
+        event.effect = "deny"
+        event.message = `Automatic review failed; blocked: ${failure}`
+        await log("error", "Permission hook review failed; blocking the command", { error: failure })
       }
-    },
-    event: async ({ event }) => {
-      const permissionEvent = event as unknown as PermissionAskedEvent
-      if (permissionEvent.type !== "permission.asked") return
-      await handlePermissionEvent(permissionEvent.properties)
-    },
-  }
-}) satisfies Plugin
+    })
+  },
+})

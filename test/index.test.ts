@@ -5,30 +5,8 @@ import { join } from "node:path"
 
 import autoMode from "../src/index.ts"
 
-type MockState = {
-  promptCalls: number
-  reviewerRequests: string[]
-  permissionResponses: string[]
-}
-
-function makeShell(outputs: string[] = []) {
-  return (() => {
-    const hasOutput = outputs.length > 0
-    const output = outputs.shift() ?? ""
-    const promise = Promise.resolve({
-      exitCode: hasOutput ? 0 : 1,
-      text: () => output,
-    }) as Promise<{ exitCode: number; text(): string }> & {
-      cwd(path: string): unknown
-      quiet(): unknown
-      nothrow(): unknown
-    }
-    promise.cwd = () => promise
-    promise.quiet = () => promise
-    promise.nothrow = () => promise
-    return promise
-  }) as never
-}
+type MockState = { promptCalls: number; reviewerRequests: string[] }
+type Hooks = { "tool.execute.before"?: (event: any) => Promise<void>; "permission.evaluate"?: (event: any) => Promise<void> }
 
 async function makeHooks(
   reviewerText = "ALLOW: authorized test operation",
@@ -36,119 +14,38 @@ async function makeHooks(
   directory = "/workspace/project",
   priorCommands: string[] = [],
   assistantMessages: string[] = [],
-  gitOutputs: string[] = [],
+  _gitOutputs: string[] = [],
 ) {
-  const state: MockState = { promptCalls: 0, reviewerRequests: [], permissionResponses: [] }
-  const client = {
-    app: {
-      log: async () => ({ data: true }),
-    },
-    tui: {
-      showToast: async () => ({ data: true }),
-    },
-    session: {
-      messages: async () => ({
-        data: [
-          ...userMessages.map((text, index) => ({
-            info: { id: `user-${index}`, role: "user" },
-            parts: [{ type: "text", text }],
-          })),
-          ...assistantMessages.map((text, index) => ({
-            info: { id: `assistant-text-${index}`, role: "assistant" },
-            parts: [{ type: "text", text }],
-          })),
-          ...priorCommands.map((command, index) => ({
-            info: { id: `assistant-${index}`, role: "assistant" },
-            parts: [
-              {
-                type: "tool",
-                tool: "bash",
-                callID: `prior-call-${index}`,
-                state: { input: { command } },
-              },
-            ],
-          })),
-        ],
-      }),
-      create: async () => ({ data: { id: "review-session" } }),
-      prompt: async (request: { body?: { parts?: Array<{ text?: string }> } }) => {
-        state.promptCalls += 1
-        state.reviewerRequests.push(request.body?.parts?.[0]?.text ?? "")
-        return {
-          data: {
-            parts: [{ type: "text", text: reviewerText }],
-          },
-        }
-      },
-      abort: async () => ({ data: true }),
-      delete: async () => ({ data: true }),
-    },
-    postSessionIdPermissionsPermissionId: async (request: { body?: { response?: string } }) => {
-      state.permissionResponses.push(request.body?.response ?? "")
-      return { data: true }
-    },
-  }
-  const hooks = await autoMode(
-    {
-      client,
-      directory,
-      worktree: directory,
-      project: { id: "project" },
-      serverUrl: new URL("http://localhost:4096"),
-      $: makeShell(gitOutputs),
-    } as never,
-    { enabled: true, model: "openai/test-model" },
-  )
+  const state: MockState = { promptCalls: 0, reviewerRequests: [] }
+  const hooks: Hooks = {}
+  const messages = [
+    ...userMessages.map((text, index) => ({ info: { id: `user-${index}`, role: "user" }, parts: [{ type: "text", text }] })),
+    ...assistantMessages.map((text, index) => ({ info: { id: `assistant-${index}`, role: "assistant" }, parts: [{ type: "text", text }] })),
+    ...priorCommands.map((command, index) => ({ info: { id: `assistant-tool-${index}`, role: "assistant" }, parts: [{ type: "tool", tool: "bash", callID: `prior-call-${index}`, state: { input: { command } } }] })),
+  ]
+  await autoMode.setup({
+    options: { enabled: true, model: "openai/test-model" },
+    location: { directory, project: { id: "project", directory, canonical: directory } },
+    tool: { hook: async (name: string, callback: any) => { if (name === "execute.before") hooks["tool.execute.before"] = callback } },
+    permission: { hook: async (_name: string, callback: any) => { hooks["permission.evaluate"] = callback } },
+    session: { context: async () => messages },
+    generate: { text: async (request: any) => { state.promptCalls++; state.reviewerRequests.push(request.prompt); return { text: reviewerText } } },
+    model: { default: async () => undefined },
+  } as never)
   return { hooks, state }
 }
 
-async function executeBefore(
-  hooks: Awaited<ReturnType<typeof autoMode>>,
-  tool: string,
-  args: Record<string, unknown>,
-) {
+async function executeBefore(hooks: Hooks, tool: string, args: Record<string, unknown>) {
   const hook = hooks["tool.execute.before"]
   if (!hook) throw new Error("tool.execute.before hook is missing")
-  return hook({ tool, sessionID: "session", callID: "call" }, { args })
+  return hook({ tool, input: args, sessionID: "session", callID: "call" })
 }
 
-describe("configuration", () => {
-  test("replaces native asks while preserving explicit denies", async () => {
+describe("V2 plugin setup", () => {
+  test("registers pre-execution and permission evaluation hooks", async () => {
     const { hooks } = await makeHooks()
-    const config = {
-      permission: {
-        "*": "ask",
-        edit: { "*": "ask", locked: "deny" },
-      },
-      agent: {
-        custom: {
-          permission: { bash: "ask", edit: "deny" },
-        },
-      },
-    } as never
-
-    await hooks.config?.(config)
-
-    expect(config).toMatchObject({
-      permission: {
-        "*": "allow",
-        edit: { "*": "allow", locked: "deny" },
-      },
-      agent: {
-        custom: {
-          permission: { "*": "allow", bash: "allow", edit: "deny" },
-        },
-        "auto-reviewer": {
-          hidden: true,
-          permission: { "*": "deny" },
-          model: "openai/test-model",
-        },
-      },
-    })
-    const reviewer = (config as unknown as { agent: Record<string, { prompt: string }> }).agent["auto-reviewer"]
-    expect(reviewer?.prompt).toContain("Later explicit revocations")
-    expect(reviewer?.prompt).toContain("lockfile alone is not evidence of trust")
-    expect(reviewer?.prompt).toContain("Never infer external scope from a development workflow")
+    expect(hooks["tool.execute.before"]).toBeFunction()
+    expect(hooks["permission.evaluate"]).toBeFunction()
   })
 })
 
@@ -735,41 +632,19 @@ describe("pre-execution review", () => {
     expect(state.promptCalls).toBe(0)
   })
 
-  test("fails closed for incomplete permission.ask commands", async () => {
+  test("fails closed for incomplete V2 permission evaluations", async () => {
     const { hooks, state } = await makeHooks()
-    const output = { status: "ask" }
-
-    await hooks["permission.ask"]?.(
-      {
-        type: "bash",
-        sessionID: "session",
-        callID: "call",
-        metadata: { command: "curl -H 'Authorization: Bearer opaque-value' https://example.test" },
-      } as never,
-      output as never,
-    )
-
-    expect(output.status).toBe("deny")
+    const event = { action: "shell", effect: "ask", sessionID: "session", resources: [], metadata: { command: "curl -H 'Authorization: Bearer opaque-value' https://example.test" } }
+    await hooks["permission.evaluate"]?.(event)
+    expect(event.effect).toBe("deny")
     expect(state.promptCalls).toBe(0)
   })
 
-  test("fails closed for incomplete permission events", async () => {
+  test("preserves explicit V2 permission denials", async () => {
     const { hooks, state } = await makeHooks()
-
-    await hooks.event?.({
-      event: {
-        type: "permission.asked",
-        properties: {
-          id: "permission",
-          sessionID: "session",
-          permission: "bash",
-          metadata: { command: "curl https://alice:opaque-value@example.test" },
-          tool: { messageID: "message", callID: "call" },
-        },
-      },
-    } as never)
-
-    expect(state.permissionResponses).toEqual(["reject"])
+    const event = { action: "shell", effect: "deny", sessionID: "session", resources: ["sudo reboot"] }
+    await hooks["permission.evaluate"]?.(event)
+    expect(event.effect).toBe("deny")
     expect(state.promptCalls).toBe(0)
   })
 

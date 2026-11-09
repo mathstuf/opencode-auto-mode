@@ -1,7 +1,7 @@
 {
   "name": "opencode-auto-mode",
   "version": "0.1.0",
-  "description": "Automatic permission classifier for OpenCode with Claude Code- and Codex-style auto mode.",
+  "description": "Automatic permission classifier plugin for OpenCode V2.",
   "type": "module",
   "main": "./src/index.ts",
   "exports": {
@@ -27,13 +27,13 @@
   ],
   "license": "MIT",
   "engines": {
-    "opencode": ">=1.18.4"
+    "opencode": ">=2.0.0"
   },
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.18.4"
+    "@opencode/plugin": ">=2.0.0"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "^1.18.4",
+    "@opencode/plugin": "^2.0.0",
     "@types/node": "^24.0.0",
     "typescript": "^5.9.3"
   }
