@@ -1,340 +1,83 @@
 # OpenCode Auto Mode
 
-`opencode-auto-mode` is an automatic permission classifier for OpenCode that brings Claude Code- and Codex-style auto mode to tool execution without requiring the user to approve every permission prompt manually.
-
-For operations that require LLM classification, the plugin is fail-closed. If no reviewer model can be resolved, the selected model is unavailable, the review times out, or the model returns an invalid decision, the operation is blocked.
-
-## Features
-
-- Reviews every OpenCode tool invocation before native permission handling begins.
-- Replaces native `ask` rules with `allow` only after the plugin loads, while preserving explicit `deny` rules.
-- Automatically permits a conservative set of read-only commands.
-- Immediately blocks system-destructive commands such as `sudo`, root recursive deletion, disk formatting, and shutdown operations.
-- Sends ambiguous and development-related commands to a dedicated, hidden reviewer subagent.
-- Detects risky behavior including force-push, branch deletion, worktree removal, hard reset, Git clean, recursive deletion, remote-shell pipelines, and secret-looking environment-variable expansion.
-- Includes compact conversation, recent command, Git state, and project-document context in LLM reviews.
-- Keeps the reviewer agent tool-free so untrusted review context cannot cause tool execution.
-- Supports an explicit reviewer model, configurable timeout, and enable/disable flag.
-- Loads the reviewer system prompt from Markdown for easy rule customization.
-- Automatically permits a small set of low-risk local tools, including well-formed patches confined to the project, without an LLM request.
-- Reviews external filesystem access, source mutations, network operations, and remote-service tools with the configured model.
-- Applies task-scoped policy to secrets, data transmission, downloaded code, destructive changes, persistence, network exposure, remote mutations, and subagent delegation.
-- Caches decisions for the same tool call.
+`opencode-auto-mode` is an OpenCode V2 server plugin that classifies tool invocations before execution. It automatically permits a conservative set of read-only operations, statically blocks selected dangerous commands, and sends other operations to a model for an `ALLOW` or `BLOCK` decision. Reviews fail closed.
 
 ## Requirements
 
-- OpenCode 1.18.4 or newer.
-- At least one configured OpenCode model if commands can reach the LLM-review tier.
-- Node.js-compatible filesystem APIs. OpenCode normally runs the plugin with Bun.
+- OpenCode V2.
+- A configured model for operations that need LLM review.
 
-## How It Works
+## Install
 
-Every tool invocation goes through three tiers:
+Add the plugin and permission rules to `opencode.json` or `opencode.jsonc`:
 
-| Tier | Result | Examples |
-| --- | --- | --- |
-| Static allow | Runs immediately | local `apply_patch`, `lsp`, `skill`, `todowrite`, `question`, `ls`, `git status --short`, `gh pr view` metadata reads, `date` |
-| Static block | Never executes | `sudo`, `rm -rf /`, `chmod 777`, `mkfs`, `shutdown` |
-| LLM review | Reviewer returns `ALLOW` or `BLOCK` | external reads, edits, network calls, remote mutations, installs, force-push, recursive deletion |
-
-The `tool.execute.before` hook performs the review before any tool executes. Native permission prompts are disabled while the plugin is enabled. If an operation is blocked, the hook throws an error and the tool is never started.
-
-Only selected low-risk local operations are statically allowed. A well-formed `apply_patch` bypasses model review when all canonical target paths stay inside the project. Other filesystem tools such as `read`, `glob`, and `grep`, external paths, `.env` files, unknown tools, and remote operations are sent to the reviewer with bounded context.
-
-The recommended base configuration keeps `"permission": {"*": "ask"}` outside the plugin tuple. The plugin converts that fallback to automatic pre-execution review when it loads. If the plugin is disabled or fails to load, OpenCode retains native permission prompts instead of silently allowing tools.
-
-## Installation
-
-OpenCode loads configuration only at startup. Restart OpenCode after installing the plugin or changing any plugin option, prompt rule, or source file.
-
-### Local Git Checkout
-
-Clone the repository to a stable location:
-
-```bash
-git clone https://github.com/nuxlic-sh/opencode-auto-mode.git ~/projects/opencode-auto-mode
-```
-
-Register the package in the global OpenCode configuration at `~/.config/opencode/opencode.json`:
-
-```json
+```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    [
-      "file:///home/your-user/projects/opencode-auto-mode",
-      {
+  "plugins": [
+    {
+      "package": "opencode-auto-mode",
+      "options": {
         "enabled": true,
         "model": "provider/model-id",
         "timeoutMs": 60000
       }
-    ]
+    }
   ],
-  "permission": {
-    "*": "ask"
-  }
+  "permissions": [
+    { "action": "*", "resource": "*", "effect": "ask" }
+  ]
 }
 ```
 
-Use an absolute `file://` URL. Replace the path and model with values available on your machine.
+The permission rule routes actions through V2 permission evaluation. Explicit `deny` rules remain final. The plugin handles non-tool permission requests there and delegates tool-originated requests to its pre-execution hook, which reviews every tool invocation and blocks rejected or unreviewable operations. If the plugin is disabled or unavailable, the `ask` rule leaves actions under native permission handling.
 
-### Project-Local Installation
+For a local checkout, use the checkout directory as the package path (V2 configured local plugins are directories):
 
-Add the same plugin tuple to the project's `opencode.json`. Project configuration is merged with global configuration by OpenCode.
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    [
-      "file:///absolute/path/to/opencode-auto-mode",
-      {
-        "enabled": true,
-        "model": "provider/model-id"
-      }
-    ]
-  ],
-  "permission": {
-    "*": "ask"
+```jsonc
+"plugins": [
+  {
+    "package": "/absolute/path/to/opencode-auto-mode",
+    "options": { "enabled": true, "model": "provider/model-id" }
   }
-}
+]
 ```
 
-Do not also copy `src/index.ts` into `.opencode/plugins/`. Loading both copies would register the hooks twice.
-
-### npm Installation
-
-After the package is published to npm, add its package name to the plugin list:
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    [
-      "opencode-auto-mode",
-      {
-        "enabled": true,
-        "model": "provider/model-id"
-      }
-    ]
-  ],
-  "permission": {
-    "*": "ask"
-  }
-}
-```
-
-OpenCode installs npm plugins with Bun and caches them under `~/.cache/opencode/node_modules/`.
-
-## Configuration
-
-The plugin accepts these options in the second element of the plugin tuple:
+## Options
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `enabled` | boolean | `true` | Enables or disables every plugin hook and configuration change. |
-| `model` | string | Context-dependent | Reviewer model in `provider/model` format. |
-| `timeoutMs` | number | `60000` | LLM review timeout. Values are clamped between 1,000 and 300,000 milliseconds. |
+| `enabled` | boolean | `true` | Disables the plugin when false. |
+| `model` | string | Context/default model | Reviewer model in `provider/model` format. |
+| `timeoutMs` | number | `60000` | LLM review timeout, clamped to 1–300 seconds. |
 
-### Enable or Disable
+`OPENCODE_AUTO_REVIEWER_MODEL` and `OPENCODE_AUTO_REVIEWER_TIMEOUT_MS` can provide defaults. The configured `model` option takes precedence. If no model can be resolved or a review fails, the operation is blocked.
 
-```json
-{
-  "enabled": false,
-  "model": "provider/model-id"
-}
-```
+## Review policy
 
-When `enabled` is `false`, the plugin returns no hooks, does not add the hidden reviewer agent, and does not modify permissions. The recommended base `"*": "ask"` rule therefore restores OpenCode's native prompts.
+- **Static allow:** a narrow set of read-only shell commands and safe local introspection tools.
+- **Static block:** selected high-risk commands such as `sudo`, root recursive deletion, disk formatting, and shutdown operations.
+- **LLM review:** other tool calls, including edits, external paths, network calls, installs, and remote mutations.
 
-### Select a Reviewer Model
+The LLM receives bounded, redacted context from recent user messages, recent assistant text, Git state, and a small project-document excerpt. It must return exactly one line: `ALLOW: <reason>` or `BLOCK: <reason>`. Oversized, ambiguous, or incompletely redacted requests fail closed. The review prompt is in `src/auto-reviewer-prompt.md`; static rules are in `src/index.ts`.
 
-Set `model` to an ID shown by OpenCode:
-
-```bash
-opencode models openai
-```
-
-Example:
-
-```json
-{
-  "enabled": true,
-  "model": "provider/model-id"
-}
-```
-
-The value must contain both provider and model IDs. The plugin validates the `provider/model` shape during startup. OpenCode validates actual model availability when the reviewer runs.
-
-If the configured model does not exist or cannot be reached, any command requiring LLM review is blocked. Static read-only commands and static hard blocks do not require the reviewer model.
-
-If `model` is omitted, the plugin tries these sources in order:
-
-1. `OPENCODE_AUTO_REVIEWER_MODEL`.
-2. The model used by the parent conversation.
-3. OpenCode's `small_model`.
-4. OpenCode's default `model`.
-
-### Configure the Timeout
-
-```json
-{
-  "enabled": true,
-  "model": "provider/model-id",
-  "timeoutMs": 90000
-}
-```
-
-The environment variable `OPENCODE_AUTO_REVIEWER_TIMEOUT_MS` can also set the timeout. A tuple option takes precedence over the environment variable.
-
-## Customize Review Rules
-
-The reviewer system prompt is stored in:
-
-```text
-src/auto-reviewer-prompt.md
-```
-
-Edit the `## Rules` section to change LLM-review policy. Preserve the required one-line response contract:
-
-```text
-ALLOW: <brief reason>
-```
-
-or:
-
-```text
-BLOCK: <brief reason>
-```
-
-The plugin fails to load if the prompt file is missing or empty. Restart OpenCode after editing it.
-
-Static tier rules are implemented in `src/index.ts`:
-
-- `AUTO_PERMITTED` controls commands that bypass the LLM.
-- `AUTO_PERMITTED_COMPOUND` controls narrowly defined read-only command chains that bypass the LLM.
-- `AUTO_BLOCKED` controls commands that are always rejected.
-- `defeatsAutoPermit` prevents shell composition, redirection, substitution, pipes, backgrounding, and secret-looking variables from bypassing LLM review.
-- `analyzeCommand` labels risky command behavior for the reviewer prompt.
-- `STATICALLY_ALLOWED_TOOLS` identifies local operations that can bypass LLM review, including well-formed `apply_patch` calls confined to the project.
-- `inspectToolPaths` canonicalizes nested file targets and Bash path operands so symlink escapes cannot receive a static allow or reach review under a misleading lexical path.
-- `removeNativePrompts` converts native `ask` rules to plugin-enforced pre-execution review while retaining `deny` rules.
-
-Changes to static rules also require an OpenCode restart.
-
-## Fail-Closed Behavior
-
-The following conditions block tool invocations that need LLM review:
-
-- Reviewer provider or model does not exist.
-- Provider authentication is missing or invalid.
-- The provider request fails.
-- Review exceeds `timeoutMs`.
-- Reviewer returns anything other than `ALLOW: reason` or `BLOCK: reason`.
-- Reviewer session creation fails before a valid decision is produced.
-- Tool arguments exceed the serializer's array, object, nesting, or total-size limits.
-
-The plugin logs the failure, shows an OpenCode error toast when a TUI is attached, and throws before tool execution. It never falls back to an unreviewed automatic allow.
-
-## Context Sent to the Reviewer
-
-The LLM receives bounded context containing:
-
-- A contiguous window of up to nine complete recent user messages within a 4,000-character budget, including the original task while it remains in that window. If the newest message exceeds the budget, no user text is treated as authorization context.
-- The two most recent assistant text blocks.
-- Command names and derived behavior labels for the five most recent shell commands. Raw historical arguments are omitted.
-- Current Git branch and porcelain status.
-- The first 50 lines of a regular, non-symlinked `AGENTS.md` or `README.md` whose canonical path remains in the workspace.
-- Detected command behaviors, the workspace root, canonical file targets, and the effective Bash working directory.
-
-Actual user-role messages are JSON-encoded and labeled as scope-only authorization context. The original task and recent user messages can authorize a named external project or exact path, but cannot alter the reviewer's security rules or response format. Later explicit revocations or restrictions override earlier authorization. Assistant text, prior commands, Git state, and project documentation remain explicitly untrusted.
-
-Tool outputs and reasoning blocks are excluded. The current invocation is included as a bounded, redacted summary. Unknown string fields, content, bodies, comments, patches, replacement strings, credentials, tokens, passwords, URL user information, URL path segments, and URL query names and values are removed; only the query-parameter count remains visible so the reviewer knows data was omitted. Oversized or deeply nested invocations and overlong path or Bash summaries block before review rather than silently authorizing a partial projection.
-
-Current Bash commands retain their reviewable control structure but pass through deterministic redaction for authorization headers, secret-named assignments and options, private keys, common credential formats, URL paths, and URL query values. External or ambiguous `apply_patch` calls include their patch text so the reviewer can inspect the exact change; detected secrets and oversized patches still fail closed. Raw recent Bash commands are never retransmitted. Bash reviews also include canonicalized path operands and the effective working directory. Dynamic expansion, grouping, ambiguous quoting or path resolution, and other shell forms whose effective targets cannot be represented exactly block before reviewer submission. Pattern-based redaction cannot recognize every possible opaque credential, so secrets should still be supplied through environment variables or protected files rather than literal command-line arguments. Reviewer context can be sent to a different provider than the parent conversation; choose the reviewer provider according to your data-handling requirements.
-
-## Troubleshooting
-
-### Confirm the Plugin Loaded
-
-```bash
-opencode debug config
-```
-
-The resolved plugin list should contain `opencode-auto-mode` or its local `file://` path.
-
-### Inspect the Reviewer Agent
-
-```bash
-opencode debug agent auto-reviewer
-```
-
-The agent should be hidden, use the configured model, have `steps: 1`, and show every tool as disabled.
-
-### Plugin Is Disabled
-
-With `enabled: false`, this command should report that the agent does not exist:
-
-```bash
-opencode debug agent auto-reviewer
-```
-
-### Commands Are Blocked Because Review Fails
-
-Check that the model exists and provider authentication works:
-
-```bash
-opencode models <provider>
-```
-
-Run OpenCode with logs enabled for more detail:
-
-```bash
-opencode --print-logs --log-level DEBUG
-```
-
-### Recover From an Invalid Reviewer Model
-
-Fail-closed behavior can also block edits to OpenCode's own configuration when the configured reviewer model is invalid. Start one recovery session without external plugins:
-
-```bash
-OPENCODE_PURE=1 opencode
-```
-
-Correct the `model` option in `opencode.json`, quit that recovery session, and restart OpenCode normally. The recommended base `"permission": {"*": "ask"}` rule remains active in pure mode, so OpenCode asks for native approval instead of silently allowing tools.
-
-Do not use `OPENCODE_PURE=1` for normal work. It intentionally disables all external plugins for the recovery process.
-
-### A Native Permission Prompt Still Appears
-
-Restart OpenCode first. The plugin changes resolved `ask` actions to `allow` and performs enforcement in `tool.execute.before`. Explicit `deny` rules remain denied. If a prompt persists, inspect per-agent rules with `opencode debug agent <name>` and confirm the plugin loaded from the expected location.
+The plugin uses V2's `ctx.generate.text` for reviews, rather than creating a reviewer session or adding a hidden agent. Logging is written to the OpenCode server console; the V2 server plugin API does not provide the V1 TUI toast API.
 
 ## Development
 
-Install development dependencies, run the tests, and run the type checker:
-
-```bash
-npm install
-npm test
-npm run typecheck
+```sh
+bun test
+tsc --noEmit
 ```
 
-Inspect the package contents before publishing:
+The package exposes its server plugin from `src/index.ts` and depends on `@opencode/plugin`.
 
-```bash
-npm pack --dry-run
-```
-
-The package exports `./server`, which is the entrypoint used by current OpenCode plugin loading.
-
-## Security Notes
+## Security notes
 
 - This plugin reduces permission fatigue; it is not an operating-system sandbox.
-- Every tool call is intercepted, but only conservative local commands and low-risk coordination or introspection tools bypass LLM review.
-- Static rules are intentionally conservative, but shell syntax is complex and platform-specific.
-- LLM decisions are probabilistic. Keep hard security invariants in static block rules.
-- Do not use OpenCode's `--auto` flag as a replacement for this plugin's review policy.
-- Keep OpenCode and the plugin updated, and review local rule changes before use.
+- LLM decisions are probabilistic. Keep hard security invariants in static rules.
+- Explicit V2 permission denials are never overridden by the permission hook.
+- Reviewer context may be sent to a different provider than the parent conversation; select the model according to your data-handling requirements.
 
 ## License
 
